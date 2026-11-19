@@ -1,32 +1,51 @@
-"""Write the 19 November 2026 world-news poster to /output/entry.png.
+"""Entry point: render the 19 November 2026 news poster to a PNG file.
 
-Stdlib plus the bundled draw.py, deterministic, no network. The poster
-is rendered by draw.py from the day's verified stories; this program
-just places it where the judge expects it and checks it.
+Reads MAKEFUN_OUTPUT_DIR (falls back to /output), asks draw.compose()
+for the finished sheet, saves it, then sanity-checks the file on disk:
+it must start with the PNG signature, measure exactly 1024 by 1024,
+and stay under one mebibyte. Anything off fails loudly instead of
+silently shipping a broken image.
 """
-import os
-import sys
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, HERE)
+import hashlib
+import os
+from pathlib import Path
+
+from PIL import Image
 
 import draw
 
-OUT_DIR = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
-DST = os.path.join(OUT_DIR, "entry.png")
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+EDGE = 1024
+BYTE_LIMIT = 1024 * 1024
+
+
+def destination():
+    """Where the poster goes: env var first, /output otherwise."""
+    folder = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder / "entry.png"
+
+
+def sanity_check(path):
+    """Confirm the saved file really is the poster we meant to ship."""
+    blob = path.read_bytes()
+    assert blob[:8] == PNG_SIGNATURE, "not a PNG file"
+    with Image.open(path) as shot:
+        assert shot.size == (EDGE, EDGE), f"wrong size: {shot.size}"
+        dims = f"{shot.size[0]}x{shot.size[1]}"
+    assert len(blob) <= BYTE_LIMIT, f"too big: {len(blob)} bytes"
+    return blob, dims
 
 
 def main():
-    os.makedirs(OUT_DIR, exist_ok=True)
-    img = draw.render()
-    img.save(DST, "PNG")
-    with open(DST, "rb") as f:
-        magic = f.read(8)
-    assert magic == b"\x89PNG\r\n\x1a\n", "entry.png is not a PNG"
-    assert img.size == (1024, 1024), f"unexpected size {img.size}"
-    size = os.path.getsize(DST)
-    assert size <= 1048576, f"entry.png is {size} bytes, over 1 MiB"
-    print("wrote", DST, size, "bytes")
+    here = Path(__file__).resolve().parent
+    sheet = draw.compose(str(here / "assets"))
+    target = destination()
+    sheet.save(target, format="PNG", optimize=True)
+    blob, dims = sanity_check(target)
+    digest = hashlib.sha256(blob).hexdigest()
+    print(f"wrote {target} ({dims}, {len(blob)} bytes, sha256 {digest})")
 
 
 if __name__ == "__main__":

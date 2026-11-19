@@ -1,238 +1,323 @@
-"""Draw the 19 November 2026 world-news poster (1024x1024 PNG).
+"""Poster painter for the 19 November 2026 world-news sheet.
 
-Pure PIL, deterministic: same input, same bytes, every run. No network,
-no clock, no randomness. Fonts are bundled in assets/ so the program
-renders identically in any sandbox.
+Everything on the page comes from the EDITION table below: one lead item,
+four card items, a strip of shorter items and a footer line. The painter
+only knows geometry; the words live in the table, so swapping a day's news
+means editing data, not drawing code.
+
+Layout (1024 x 1024, all coordinates in pixels):
+    masthead band, lead row (words left, picture right),
+    a 2 x 2 grid of cards, an "also today" band, a footer line.
 """
-import os
 
 from PIL import Image, ImageDraw, ImageFont
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-ASSETS = os.path.join(HERE, "assets")
+CANVAS = (1024, 1024)
+MARGIN = 40
+GUTTER = 24
 
-W = H = 1024
+INK = (22, 28, 44)          # near-black navy for text
+NAVY = (23, 35, 61)         # masthead / strip background
+NAVY_DEEP = (16, 26, 48)    # picture panel background
+PAPER = (247, 243, 232)     # page background
+CARD = (255, 255, 255)
+CARD_EDGE = (203, 196, 178)
+RULE = (201, 194, 176)
+GOLD = (212, 175, 55)
+GOLD_SOFT = (226, 196, 110)
+CRIMSON = (178, 34, 52)
+TEAL = (15, 118, 110)
+MUTED = (96, 96, 92)
+BODY = (52, 52, 50)
 
-PAPER = (247, 243, 234)
-INK = (22, 22, 26)
-NAVY = (27, 42, 65)
-NAVY2 = (18, 30, 48)
-GOLD = (201, 162, 39)
-RED = (166, 38, 57)
-MUTED = (96, 92, 84)
-BODY = (56, 54, 50)
-CARD_BG = (255, 255, 255)
-TEAL = (31, 111, 107)
-SKY = (52, 84, 120)
+EDITION = {
+    "kicker": "THE WORLD IN ONE DAY",
+    "dateline": "THURSDAY, 19 NOVEMBER 2026",
+    "lead": {
+        "tag": "SHENZHEN  \u00b7  APEC SUMMIT",
+        "headline": "Three presidents, one table in Shenzhen",
+        "body": (
+            "Trump, Xi and Putin meet together for the first time, with an "
+            "hour set aside for nuclear arms, Ukraine, Iran and trade. "
+            "No deal is expected."
+        ),
+    },
+    "cards": [
+        {
+            "tag": "GAMES  \u00b7  CULTURE",
+            "headline": "GTA VI rolls out around the world",
+            "body": (
+                "After 13 years, it unlocks at midnight in each market. "
+                "99 on Metacritic."
+            ),
+            "glyph": "bars",
+        },
+        {
+            "tag": "SPACE  \u00b7  SCIENCE",
+            "headline": "NASA confirms Voyager 1 is a light-day away",
+            "body": (
+                "Launched in 1977, now the first human-made object "
+                "16 billion miles out. Signals take a day."
+            ),
+            "glyph": "dish",
+        },
+        {
+            "tag": "WEATHER  \u00b7  INDIA",
+            "headline": "Cyclone Akvan bears down on India's east",
+            "body": (
+                "A very severe cyclone nears India's coast, winds of "
+                "120-130 km/h at landfall due Friday."
+            ),
+            "glyph": "swirl",
+        },
+        {
+            "tag": "MIDDLE EAST  \u00b7  GULF WAR",
+            "headline": "Iran widens its attacks on US bases in the Gulf",
+            "body": (
+                "Tehran's drones hit a US base in Kuwait and sites in "
+                "Bahrain. No US staff hurt."
+            ),
+            "glyph": "target",
+        },
+    ],
+    "also": [
+        "Pew: Islam to be the largest faith by 2035",
+        "Earth's missing billion years may be solved",
+        "Canada's Carney recalibrates China ties",
+        "US senators warn on AI cyber threats",
+    ],
+    "footer": (
+        "All stories as reported on 19 November 2026  \u00b7  "
+        "Sources: Reuters, AP, NASA, IMD"
+    ),
+}
 
 
-def font(size, bold=False):
-    name = "DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf"
-    path = os.path.join(ASSETS, name)
-    if os.path.exists(path):
-        return ImageFont.truetype(path, size)
-    return ImageFont.truetype("DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf", size)
+class Typefaces:
+    """Loads the bundled DejaVu faces once and hands out sizes."""
+
+    def __init__(self, folder):
+        self.regular = folder + "/DejaVuSans.ttf"
+        self.bold = folder + "/DejaVuSans-Bold.ttf"
+        self._cache = {}
+
+    def at(self, size, heavy=False):
+        key = (size, heavy)
+        if key not in self._cache:
+            path = self.bold if heavy else self.regular
+            self._cache[key] = ImageFont.truetype(path, size)
+        return self._cache[key]
 
 
-def wrap(d, text, fnt, max_w):
-    """Greedy word wrap; returns a list of lines that fit max_w."""
-    lines, cur = [], ""
+def fold(draw, text, font, width):
+    """Split text into lines that fit `width`, word by word."""
+    lines, current = [], ""
     for word in text.split():
-        trial = f"{cur} {word}".strip()
-        if d.textlength(trial, font=fnt) <= max_w:
-            cur = trial
+        trial = word if not current else current + " " + word
+        if draw.textlength(trial, font=font) <= width:
+            current = trial
         else:
-            if cur:
-                lines.append(cur)
-            cur = word
-    if cur:
-        lines.append(cur)
+            if current:
+                lines.append(current)
+            current = word
+    if current:
+        lines.append(current)
     return lines
 
 
-def text_block(d, x, y, lines, fnt, fill, leading):
-    for line in lines:
-        d.text((x, y), line, font=fnt, fill=fill)
-        y += leading
-    return y
+def tracked(draw, xy, text, font, fill, step):
+    """Draw text with extra space between letters (masthead kicker)."""
+    x, y = xy
+    for ch in text:
+        draw.text((x, y), ch, font=font, fill=fill)
+        x += draw.textlength(ch, font=font) + step
+    return x
 
 
-def flag(d, x, y, w, h, kind):
-    """A small national flag: usa, china or russia."""
-    if kind == "usa":
-        for i in range(7):
-            col = (178, 34, 52) if i % 2 == 0 else (255, 255, 255)
-            d.rectangle([x, y + i * h // 7, x + w, y + (i + 1) * h // 7], fill=col)
-        d.rectangle([x, y, x + w * 2 // 5, y + h * 4 // 7], fill=(60, 59, 110))
-        for r in range(3):
-            for c in range(3):
-                d.ellipse([x + 5 + c * 11, y + 5 + r * 11, x + 9 + c * 11, y + 9 + r * 11],
-                          fill=(255, 255, 255))
-    elif kind == "china":
-        d.rectangle([x, y, x + w, y + h], fill=(222, 41, 16))
-        d.ellipse([x + 8, y + 8, x + 22, y + 22], fill=(255, 222, 0))
-        for sx, sy in [(34, 10), (42, 18), (42, 28), (34, 34)]:
-            d.ellipse([x + sx, y + sy, x + sx + 6, y + sy + 6], fill=(255, 222, 0))
-    else:  # russia
-        d.rectangle([x, y, x + w, y + h // 3], fill=(255, 255, 255))
-        d.rectangle([x, y + h // 3, x + w, y + 2 * h // 3], fill=(0, 57, 166))
-        d.rectangle([x, y + 2 * h // 3, x + w, y + h], fill=(213, 0, 50))
+def _stars(draw, cx, cy, count, spread, colour):
+    for i in range(count):
+        ox = (i % 4) * spread - spread * 1.5
+        oy = (i // 4) * spread - spread
+        draw.ellipse([cx + ox - 2, cy + oy - 2, cx + ox + 2, cy + oy + 2],
+                     fill=colour)
 
 
-def draw_summit(d, x0, y0, x1, y1):
-    """Three flags over a conference table, Shenzhen dusk."""
-    d.rectangle([x0, y0, x1, y1], fill=NAVY2)
-    # stars
-    for sx, sy in [(x0 + 30, y0 + 26), (x0 + 90, y0 + 52), (x0 + 180, y0 + 22),
-                   (x0 + 250, y0 + 58), (x0 + 320, y0 + 30)]:
-        d.ellipse([sx, sy, sx + 4, sy + 4], fill=GOLD)
-    # flag poles
-    fw, fh = 84, 56
-    for i, kind in enumerate(["usa", "china", "russia"]):
-        fx = x0 + 36 + i * 118
-        d.rectangle([fx + fw // 2 - 2, y0 + 30, fx + fw // 2 + 2, y0 + 30 + fh + 74], fill=(200, 190, 160))
-        flag(d, fx, y0 + 36, fw, fh, kind)
-    # skyline silhouette
-    base = y1 - 62
-    for tx, th, tw in [(x0 + 8, 44, 34), (x0 + 52, 70, 30), (x0 + 92, 50, 38),
-                       (x0 + 140, 82, 32), (x0 + 182, 56, 36), (x0 + 228, 74, 30),
-                       (x0 + 268, 48, 34), (x0 + 312, 66, 30)]:
-        d.rectangle([tx, base - th, tx + tw, base], fill=(38, 54, 78))
-        for wy in range(base - th + 10, base - 8, 16):
-            d.rectangle([tx + 6, wy, tx + 12, wy + 6], fill=GOLD)
-    # table
-    d.rectangle([x0, base, x1, y1], fill=(24, 38, 58))
-    d.ellipse([x0 + 52, base - 14, x1 - 52, base + 26], fill=(120, 92, 52))
-    d.ellipse([x0 + 62, base - 10, x1 - 62, base + 18], fill=(150, 118, 66))
+def _flag_us(draw, x, y, w, h):
+    draw.rectangle([x, y, x + w, y + h], fill=(178, 34, 52))
+    for i in range(1, 7, 2):
+        draw.rectangle([x, y + h * i / 7, x + w, y + h * (i + 1) / 7],
+                       fill=(255, 255, 255))
+    draw.rectangle([x, y, x + w * 0.42, y + h * 4 / 7], fill=(30, 58, 138))
+    _stars(draw, x + w * 0.21, y + h * 2 / 7, 8, 11, (255, 255, 255))
 
 
-def icon(d, x, y, kind):
-    """A small square glyph for a story card."""
-    d.rectangle([x, y, x + 84, y + 84], fill=NAVY)
-    if kind == "gta":
-        # skyline + big VI
-        for tx, th, tw in [(x + 10, 20, 12), (x + 28, 28, 12), (x + 46, 16, 12), (x + 64, 24, 10)]:
-            d.rectangle([tx, y + 78 - th, tx + tw, y + 78], fill=GOLD)
-        d.text((x + 14, y + 4), "VI", font=font(30, bold=True), fill=(255, 255, 255))
-    elif kind == "voyager":
-        for sx, sy in [(x + 12, y + 14), (x + 30, y + 8), (x + 58, y + 16), (x + 70, y + 34), (x + 20, y + 30)]:
-            d.ellipse([sx, sy, sx + 3, sy + 3], fill=(255, 255, 255))
-        d.polygon([(x + 20, y + 70), (x + 46, y + 38), (x + 64, y + 66)], outline=GOLD, width=3)
-        d.line([x + 42, y + 52, x + 42, y + 76], fill=GOLD, width=3)
-        d.line([x + 42, y + 52, x + 70, y + 20], fill=(255, 255, 255), width=2)
-    elif kind == "cyclone":
-        cx, cy = x + 42, y + 42
+def _flag_cn(draw, x, y, w, h):
+    draw.rectangle([x, y, x + w, y + h], fill=(222, 41, 16))
+    draw.ellipse([x + w * 0.14, y + h * 0.16, x + w * 0.34, y + h * 0.48],
+                 fill=(255, 222, 0))
+    for dx, dy in ((0.55, 0.18), (0.68, 0.32), (0.66, 0.55), (0.5, 0.62)):
+        draw.ellipse([x + w * dx - 3, y + h * dy - 3,
+                      x + w * dx + 3, y + h * dy + 3], fill=(255, 222, 0))
+
+
+def _flag_ru(draw, x, y, w, h):
+    for i, colour in enumerate(((255, 255, 255), (0, 57, 166), (213, 0, 50))):
+        draw.rectangle([x, y + h * i / 3, x + w, y + h * (i + 1) / 3],
+                       fill=colour)
+
+
+def paint_lead_art(draw, box):
+    """Night skyline, three flags on poles, one round table."""
+    x0, y0, x1, y1 = box
+    draw.rectangle(box, fill=NAVY_DEEP)
+    for sx, sy in ((30, 26), (120, 52), (210, 20), (300, 60), (360, 30),
+                   (70, 90), (250, 100), (330, 110), (170, 70)):
+        draw.ellipse([x0 + sx - 2, y0 + sy - 2, x0 + sx + 2, y0 + sy + 2],
+                     fill=GOLD_SOFT)
+    blocks = [(8, 150, 62, 96), (78, 128, 58, 118), (150, 158, 66, 88),
+              (232, 120, 60, 126), (306, 150, 58, 96), (340, 138, 52, 108)]
+    for bx, by, bw, bh in blocks:
+        draw.rectangle([x0 + bx, y0 + by, x0 + bx + bw, y1 - 62],
+                       fill=(38, 54, 92))
+        for wy in range(by + 14, by + bh - 16, 26):
+            for wx in (bx + 12, bx + bw - 20):
+                draw.rectangle([x0 + wx, y0 + wy, x0 + wx + 8, y0 + wy + 10],
+                               fill=GOLD_SOFT)
+    draw.ellipse([x0 + 60, y1 - 72, x1 - 60, y1 - 28], fill=(146, 110, 52))
+    draw.ellipse([x0 + 60, y1 - 72, x1 - 60, y1 - 48], fill=(176, 138, 72))
+    flags = ((_flag_us, 36), (_flag_cn, 168), (_flag_ru, 300))
+    for painter, fx in flags:
+        draw.rectangle([x0 + fx + 34, y0 + 22, x0 + fx + 38, y1 - 62],
+                       fill=(214, 205, 180))
+        painter(draw, x0 + fx - 28, y0 + 26, 96, 58)
+
+
+def paint_glyph(draw, box, kind, faces):
+    """Small square emblem drawn from primitives, per card."""
+    x0, y0, x1, y1 = box
+    draw.rectangle(box, fill=NAVY)
+    cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+    if kind == "bars":
+        draw.text((cx, y0 + 6), "VI", font=faces.at(22, heavy=True),
+                  fill=(255, 255, 255), anchor="ma")
+        tops = (34, 26, 30, 20)
+        for i, top in enumerate(tops):
+            bx = x0 + 10 + i * 15
+            draw.rectangle([bx, y1 - 10 - top, bx + 11, y1 - 10],
+                           fill=GOLD)
+    elif kind == "dish":
+        for sx, sy in ((14, 12), (34, 22), (58, 10), (70, 28)):
+            draw.ellipse([x0 + sx - 1, y0 + sy - 1, x0 + sx + 1, y0 + sy + 1],
+                         fill=(255, 255, 255))
+        draw.line([cx - 6, cy + 26, cx + 26, cy - 22], fill=(255, 255, 255),
+                  width=3)
+        draw.polygon([(cx - 26, cy + 26), (cx + 6, cy + 26), (cx - 10, cy - 2)],
+                     outline=GOLD, width=3)
+    elif kind == "swirl":
         for r in (30, 22, 14):
-            d.arc([cx - r, cy - r, cx + r, cy + r], 20, 300, fill=(255, 255, 255), width=4)
-        d.ellipse([cx - 5, cy - 5, cx + 5, cy + 5], fill=GOLD)
-        for rx in (x + 14, x + 34, x + 54):
-            d.line([rx, y + 72, rx - 4, y + 80], fill=(140, 190, 220), width=3)
-    else:  # gulf: radar rings + signal
-        cx, cy = x + 42, y + 42
-        for r in (30, 20, 10):
-            d.ellipse([cx - r, cy - r, cx + r, cy + r], outline=(255, 255, 255), width=2)
-        d.line([cx, cy, cx + 24, cy - 18], fill=GOLD, width=3)
-        d.ellipse([cx - 4, cy - 4, cx + 4, cy + 4], fill=RED)
+            draw.arc([cx - r, cy - r, cx + r, cy + r], 20, 300,
+                     fill=(255, 255, 255), width=3)
+        draw.ellipse([cx - 5, cy - 5, cx + 5, cy + 5], fill=GOLD)
+        for rx in (18, 40, 62):
+            draw.line([x0 + rx, y1 - 16, x0 + rx - 5, y1 - 6],
+                      fill=(140, 190, 220), width=2)
+    elif kind == "target":
+        for r in (30, 21, 12):
+            draw.ellipse([cx - r, cy - r, cx + r, cy + r],
+                         outline=(255, 255, 255), width=3)
+        draw.ellipse([cx - 5, cy - 5, cx + 5, cy + 5], fill=CRIMSON)
+        draw.line([cx + 4, cy - 4, cx + 26, cy - 26], fill=GOLD, width=3)
 
 
-def draw_card(d, x, y, w, h, kicker, headline, body, glyph):
-    d.rectangle([x, y, x + w, y + h], fill=CARD_BG, outline=(208, 202, 188), width=2)
-    d.rectangle([x, y, x + w, y + 6], fill=TEAL)
-    icon(d, x + 16, y + 20, glyph)
-    tx = x + 116
-    tw = w - 132
-    d.text((tx, y + 16), kicker, font=font(17, bold=True), fill=RED)
-    hl = wrap(d, headline, font(24, bold=True), tw)
-    yy = text_block(d, tx, y + 40, hl[:2], font(24, bold=True), INK, 29)
-    bl = wrap(d, body, font(18), tw)
-    text_block(d, tx, yy + 6, bl[:3], font(18), BODY, 23)
+def paint_masthead(draw, faces):
+    draw.rectangle([0, 0, CANVAS[0], 148], fill=NAVY)
+    tracked(draw, (MARGIN, 26), EDITION["kicker"], faces.at(26, heavy=True),
+            GOLD, 7)
+    draw.text((MARGIN, 58), EDITION["dateline"],
+              font=faces.at(52, heavy=True), fill=(255, 255, 255))
+    draw.rectangle([0, 148, CANVAS[0], 154], fill=GOLD)
 
 
-def render():
-    img = Image.new("RGB", (W, H), PAPER)
-    d = ImageDraw.Draw(img)
-
-    # ---- masthead ----
-    d.rectangle([0, 0, W, 140], fill=NAVY)
-    d.text((40, 24), "T H E   W O R L D   I N   O N E   D A Y", font=font(21, bold=True), fill=GOLD)
-    d.text((40, 56), "THURSDAY, 19 NOVEMBER 2026", font=font(50, bold=True), fill=(255, 255, 255))
-    d.rectangle([0, 136, W, 140], fill=GOLD)
-
-    # ---- lead story: trilateral summit in Shenzhen ----
-    d.text((40, 162), "SHENZHEN  ·  APEC SUMMIT", font=font(20, bold=True), fill=RED)
-    lead_head = wrap(d, "Three presidents, one table in Shenzhen", font(38, bold=True), 560)
-    text_block(d, 40, 192, lead_head, font(38, bold=True), INK, 46)
-    lead_body = wrap(
-        d,
-        "Trump, Xi and Putin meet together for the first time, with an "
-        "hour set aside for nuclear arms, Ukraine, Iran and trade. "
-        "No deal is expected to be announced.",
-        font(22), 560)
-    text_block(d, 40, 192 + len(lead_head) * 46 + 12, lead_body, font(22), BODY, 29)
-    draw_summit(d, 624, 162, 984, 440)
-
-    d.line([40, 462, 984, 462], fill=(200, 192, 176), width=2)
-
-    # ---- four more stories ----
-    cards = [
-        ("GAMES  ·  CULTURE",
-         "GTA VI rolls out around the world",
-         "After 13 years, Rockstar's game unlocks at midnight in each "
-         "market, starting in New Zealand.",
-         "gta"),
-        ("SPACE  ·  SCIENCE",
-         "NASA confirms Voyager 1 is a light-day away",
-         "Launched in 1977, it is the first human-made object 16 billion "
-         "miles out. A signal takes a full day.",
-         "voyager"),
-        ("WEATHER  ·  INDIA",
-         "Cyclone Akvan bears down on India's east coast",
-         "A very severe cyclone nears India's coast, winds of 120-130 "
-         "km/h at landfall due Friday.",
-         "cyclone"),
-        ("MIDDLE EAST  ·  GULF WAR",
-         "Iran widens its attacks on US bases in the Gulf",
-         "Tehran's drones hit a US base in Kuwait and sites in Bahrain. "
-         "No US staff hurt.",
-         "gulf"),
-    ]
-    cw, ch = 462, 182
-    positions = [(40, 482), (522, 482), (40, 676), (522, 676)]
-    for (kicker, head, body, glyph), (cx, cy) in zip(cards, positions):
-        draw_card(d, cx, cy, cw, ch, kicker, head, body, glyph)
-
-    # ---- also today ----
-    d.rectangle([40, 878, 984, 972], fill=NAVY)
-    d.text((60, 890), "ALSO TODAY", font=font(20, bold=True), fill=GOLD)
-    also_left = [
-        "Pew: Islam to be the largest faith by 2035",
-        "Earth's missing billion years may be solved",
-    ]
-    also_right = [
-        "Canada's Carney recalibrates China ties",
-        "US senators warn on AI cyber threats",
-    ]
-    yy = 922
-    for line in also_left:
-        d.text((60, yy), "·  " + line, font=font(17), fill=(235, 232, 224))
-        yy += 26
-    yy = 922
-    for line in also_right:
-        d.text((522, yy), "·  " + line, font=font(17), fill=(235, 232, 224))
-        yy += 26
-
-    d.text((40, 986), "All stories as reported on 19 November 2026  ·  Sources: Reuters, AP, NASA, IMD, Pew, Space.com",
-           font=font(15), fill=MUTED)
-    return img
+def paint_lead(draw, faces):
+    top = 182
+    art = (584, top, CANVAS[0] - MARGIN, top + 268)
+    paint_lead_art(draw, art)
+    text_w = 584 - MARGIN - 28
+    draw.text((MARGIN, top), EDITION["lead"]["tag"],
+              font=faces.at(21, heavy=True), fill=CRIMSON)
+    y = top + 38
+    for line in fold(draw, EDITION["lead"]["headline"],
+                     faces.at(40, heavy=True), text_w):
+        draw.text((MARGIN, y), line, font=faces.at(40, heavy=True), fill=INK)
+        y += 48
+    y += 8
+    for line in fold(draw, EDITION["lead"]["body"], faces.at(21), text_w):
+        draw.text((MARGIN, y), line, font=faces.at(21), fill=BODY)
+        y += 29
+    draw.line([MARGIN, 486, CANVAS[0] - MARGIN, 486], fill=RULE, width=2)
 
 
-def main():
-    import sys
-    out = sys.argv[1] if len(sys.argv) > 1 else "entry.png"
-    img = render()
-    img.save(out, "PNG")
-    print("wrote", out, os.path.getsize(out), "bytes")
+def paint_card(draw, faces, item, box):
+    """Icon + tag + headline up top, body text full-width underneath."""
+    x0, y0, x1, y1 = box
+    draw.rectangle(box, fill=CARD, outline=CARD_EDGE, width=2)
+    draw.rectangle([x0, y0, x1, y0 + 7], fill=TEAL)
+    icon = (x0 + 16, y0 + 16, x0 + 92, y0 + 92)
+    paint_glyph(draw, icon, item["glyph"], faces)
+    tx = x0 + 108
+    tw = x1 - tx - 16
+    draw.text((tx, y0 + 18), item["tag"], font=faces.at(17, heavy=True),
+              fill=CRIMSON)
+    y = y0 + 42
+    for line in fold(draw, item["headline"], faces.at(24, heavy=True), tw):
+        draw.text((tx, y), line, font=faces.at(24, heavy=True), fill=INK)
+        y += 29
+    by = y0 + 104
+    for line in fold(draw, item["body"], faces.at(18),
+                     x1 - x0 - 32):
+        draw.text((x0 + 16, by), line, font=faces.at(18), fill=BODY)
+        by += 24
 
 
-if __name__ == "__main__":
-    main()
+def paint_grid(draw, faces):
+    cw = (CANVAS[0] - 2 * MARGIN - GUTTER) // 2
+    ch = 168
+    top = 500
+    for i, item in enumerate(EDITION["cards"]):
+        col, row = i % 2, i // 2
+        x0 = MARGIN + col * (cw + GUTTER)
+        y0 = top + row * (ch + 14)
+        paint_card(draw, faces, item, (x0, y0, x0 + cw, y0 + ch))
+
+
+def paint_also(draw, faces):
+    y0, y1 = 862, 960
+    draw.rectangle([MARGIN, y0, CANVAS[0] - MARGIN, y1], fill=NAVY)
+    draw.text((MARGIN + 18, y0 + 12), "ALSO TODAY",
+              font=faces.at(22, heavy=True), fill=GOLD)
+    col_w = (CANVAS[0] - 2 * MARGIN - 36 - GUTTER) // 2
+    for i, entry in enumerate(EDITION["also"]):
+        col, row = i % 2, i // 2
+        x = MARGIN + 18 + col * (col_w + GUTTER)
+        y = y0 + 46 + row * 28
+        draw.text((x, y), "\u00b7", font=faces.at(19, heavy=True),
+                  fill=GOLD_SOFT)
+        draw.text((x + 16, y), entry, font=faces.at(18), fill=(255, 255, 255))
+
+
+def paint_footer(draw, faces):
+    draw.text((MARGIN, 974), EDITION["footer"], font=faces.at(17),
+              fill=MUTED)
+
+
+def compose(assets_dir):
+    """Build the whole poster and hand back a PIL image."""
+    faces = Typefaces(assets_dir)
+    sheet = Image.new("RGB", CANVAS, PAPER)
+    draw = ImageDraw.Draw(sheet)
+    paint_masthead(draw, faces)
+    paint_lead(draw, faces)
+    paint_grid(draw, faces)
+    paint_also(draw, faces)
+    paint_footer(draw, faces)
+    return sheet
